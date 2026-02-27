@@ -183,101 +183,106 @@ export default function App() {
       }
   };
 
+  const cleanText = (text: string) => {
+    if (!text) return text;
+    
+    // Preserve leading/trailing whitespace (indentation)
+    const match = text.match(/^(\s*)([\s\S]*?)(\s*)$/);
+    if (!match) return text;
+    const [_, leading, content, trailing] = match;
+    
+    let processed = content;
+    
+    // 1. Remove spaces before punctuation ( "word ." -> "word." )
+    processed = processed.replace(/[ \t]+([.,!?:;])/g, '$1');
+    
+    // 2. Remove double spaces ( "word  word" -> "word word" )
+    processed = processed.replace(/[ \t]{2,}/g, ' ');
+    
+    // 3. Add space after punctuation if missing ( "word,word" -> "word, word" )
+    // Look for punctuation followed by a letter (to avoid 3.14 or 1,000)
+    // Using \p{L} requires 'u' flag
+    processed = processed.replace(/([.,!?:;])(?=\p{L})/gu, '$1 ');
+    
+    return leading + processed + trailing;
+  };
+
   const translateBatch = async (texts: string[], targetLang: string, ai: GoogleGenAI, glossaryJson: string): Promise<string[]> => {
     if (texts.length === 0) return [];
     
-    // Use smaller chunks with Index-Keyed JSON to prevent alignment shifts
-    const CHUNK_SIZE = 15; 
+    // Reverting to safe, sequential processing with small chunks
+    const CHUNK_SIZE = 10;
     const chunks = [];
     for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
       chunks.push(texts.slice(i, i + CHUNK_SIZE));
     }
 
-    const translatedChunks = new Array(chunks.length);
-    let completedChunks = 0;
-
-    // Process in parallel batches of 3
-    const CONCURRENCY = 3;
+    const translatedChunks = [];
     
-    for (let i = 0; i < chunks.length; i += CONCURRENCY) {
-        const batch = chunks.slice(i, i + CONCURRENCY);
-        const promises = batch.map(async (chunk, batchIndex) => {
-            const globalIndex = i + batchIndex;
-            try {
-                let glossaryInstruction = "";
-                if (glossaryJson && glossaryJson.length > 2) {
-                    glossaryInstruction = `
-                    IMPORTANT: Use the following glossary for proper names to ensure consistency. 
-                    If a name from this list appears, use the provided translation EXACTLY.
-                    Glossary: ${glossaryJson}
-                    `;
-                }
+    for (let i = 0; i < chunks.length; i++) {
+        const chunk = chunks[i];
+        // Update progress
+        setProgress(Math.round((i / chunks.length) * 100));
 
-                // Create an indexed object: { "0": "text1", "1": "text2" }
-                const indexedChunk: Record<string, string> = {};
-                chunk.forEach((text, idx) => {
-                    indexedChunk[idx.toString()] = text;
-                });
-
-                const prompt = `You are a professional translator. Translate the values in the following JSON object into ${targetLang}.
-                
-                CRITICAL RULES:
-                1. Return ONLY a JSON object.
-                2. The keys MUST be exactly the same as the input keys ("0", "1", etc.). DO NOT change keys.
-                3. The values should be the translated text.
-                4. Preserve original formatting (spaces, capitalization, punctuation).
-                5. If a segment is a number, code, or symbol, return it exactly as is.
-                ${glossaryInstruction}
-                
-                Input JSON:
-                ${JSON.stringify(indexedChunk)}`;
-                
-                const response = await ai.models.generateContent({
-                  model: "gemini-3-flash-preview",
-                  contents: prompt,
-                  config: {
-                      responseMimeType: "application/json",
-                      responseSchema: {
-                          type: Type.OBJECT,
-                          properties: {
-                              // We can't define dynamic properties easily in schema, so we use simpler object type
-                              // or just rely on JSON mode without strict schema for dynamic keys if needed,
-                              // but Type.OBJECT usually works well for free-form JSON.
-                          }
-                      }
-                  }
-                });
-                
-                const jsonStr = response.text;
-                if (!jsonStr) {
-                  translatedChunks[globalIndex] = chunk; // Fallback
-                  return;
-                }
-                
-                const parsed = JSON.parse(jsonStr) as Record<string, string>;
-                
-                // Reconstruct array ensuring order and existence
-                const resultChunk = chunk.map((originalText, idx) => {
-                    const key = idx.toString();
-                    if (parsed[key] !== undefined) {
-                        return parsed[key];
-                    }
-                    // If key missing, fallback to original
-                    return originalText;
-                });
-
-                translatedChunks[globalIndex] = resultChunk;
-
-            } catch (e) {
-                console.error(`Batch translation error (Chunk ${globalIndex+1}):`, e);
-                translatedChunks[globalIndex] = chunk; // Fallback
-            } finally {
-                completedChunks++;
-                setProgress(Math.round((completedChunks / chunks.length) * 100));
+        try {
+            let glossaryInstruction = "";
+            if (glossaryJson && glossaryJson.length > 2) {
+                glossaryInstruction = `
+                IMPORTANT: Use the following glossary for proper names to ensure consistency. 
+                If a name from this list appears, use the provided translation EXACTLY.
+                Glossary: ${glossaryJson}
+                `;
             }
-        });
 
-        await Promise.all(promises);
+            const prompt = `You are a professional translator. Translate the following array of text segments into ${targetLang}.
+            
+            Rules:
+            1. Return ONLY a JSON array of strings.
+            2. The array MUST have exactly ${chunk.length} items.
+            3. Preserve the original meaning, tone, and formatting (like spaces at start/end).
+            4. If a segment is just a number or symbol, return it as is.
+            ${glossaryInstruction}
+            
+            Input segments:
+            ${JSON.stringify(chunk)}`;
+            
+            const response = await ai.models.generateContent({
+              model: "gemini-3-flash-preview",
+              contents: prompt,
+              config: {
+                  responseMimeType: "application/json",
+                  responseSchema: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING }
+                  }
+              }
+            });
+            
+            const jsonStr = response.text;
+            if (!jsonStr) {
+              translatedChunks.push(chunk); // Fallback
+              continue;
+            }
+            
+            const parsed = JSON.parse(jsonStr) as string[];
+            
+            // Fallback for length mismatch
+            while (parsed.length < chunk.length) {
+                parsed.push(chunk[parsed.length]);
+            }
+            // If too long, truncate
+            if (parsed.length > chunk.length) {
+                parsed.length = chunk.length;
+            }
+            
+            // Apply text cleaning (remove double spaces, fix punctuation)
+            const cleaned = parsed.map(cleanText);
+            translatedChunks.push(cleaned);
+
+        } catch (e) {
+            console.error(`Batch translation error (Chunk ${i+1}):`, e);
+            translatedChunks.push(chunk); // Fallback
+        }
     }
     
     return translatedChunks.flat();
