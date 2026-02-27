@@ -1,0 +1,5 @@
+{
+  "name": "DocxTranslator SaaS",
+  "description": "SaaS application for translating .docx files while preserving structure and styles.",
+  "requestFramePermissions": []
+}
