@@ -19,13 +19,13 @@ const UI_STRINGS = {
     title: "DocxTranslator SaaS",
     subtitle: "v1.3.0 Client-Side AI",
     heroTitle: "Translate Documents while Preserving Formatting",
-    heroDesc: "Upload your document. Our engine isolates markup, translates content with AI (Client-Side), and reconstructs the document.",
+    heroDesc: "Upload your document. Our engine isolates markup, translates content (Client-Side), and reconstructs the document.",
     dragDrop: "Drag & drop your file here",
     browse: "or click to browse from your computer",
     selectFile: "Select File",
     processing: "Processing document...",
     extracting: "Extracting text...",
-    translating: "Translating with AI...",
+    translating: "Translating...",
     compiling: "Reconstructing document...",
     complete: "Translation Complete!",
     download: "Download Translated File",
@@ -43,15 +43,15 @@ const UI_STRINGS = {
   },
   ru: {
     title: "DocxTranslator SaaS",
-    subtitle: "v1.3.0 Client-Side AI",
+    subtitle: "v1.3.0 Client-Side",
     heroTitle: "Перевод документов с сохранением форматирования",
-    heroDesc: "Загрузите ваш документ. Наш движок изолирует разметку, переводит контент с помощью ИИ (на клиенте) и пересобирает документ.",
+    heroDesc: "Загрузите ваш документ. Наш движок изолирует разметку, переводит контент (на клиенте) и пересобирает документ.",
     dragDrop: "Перетащите файл сюда",
     browse: "или нажмите для выбора",
     selectFile: "Выбрать файл",
     processing: "Обработка документа...",
     extracting: "Извлечение текста...",
-    translating: "Перевод с помощью ИИ...",
+    translating: "Перевод...",
     compiling: "Сборка документа...",
     complete: "Перевод завершен!",
     download: "Скачать переведенный файл",
@@ -186,8 +186,8 @@ export default function App() {
   const translateBatch = async (texts: string[], targetLang: string, ai: GoogleGenAI, glossaryJson: string): Promise<string[]> => {
     if (texts.length === 0) return [];
     
-    // Reduced chunk size to prevent alignment errors (Gemini can lose count with too many items)
-    const CHUNK_SIZE = 20; 
+    // Use smaller chunks with Index-Keyed JSON to prevent alignment shifts
+    const CHUNK_SIZE = 15; 
     const chunks = [];
     for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
       chunks.push(texts.slice(i, i + CHUNK_SIZE));
@@ -213,18 +213,24 @@ export default function App() {
                     `;
                 }
 
-                const prompt = `You are a professional translator. Translate the following array of text segments into ${targetLang}.
+                // Create an indexed object: { "0": "text1", "1": "text2" }
+                const indexedChunk: Record<string, string> = {};
+                chunk.forEach((text, idx) => {
+                    indexedChunk[idx.toString()] = text;
+                });
+
+                const prompt = `You are a professional translator. Translate the values in the following JSON object into ${targetLang}.
                 
                 CRITICAL RULES:
-                1. Return ONLY a JSON array of strings.
-                2. The output array MUST have EXACTLY ${chunk.length} items. Count them carefully.
-                3. Map each input segment 1-to-1 to an output segment. DO NOT merge or split segments.
+                1. Return ONLY a JSON object.
+                2. The keys MUST be exactly the same as the input keys ("0", "1", etc.). DO NOT change keys.
+                3. The values should be the translated text.
                 4. Preserve original formatting (spaces, capitalization, punctuation).
                 5. If a segment is a number, code, or symbol, return it exactly as is.
                 ${glossaryInstruction}
                 
-                Input segments (${chunk.length} items):
-                ${JSON.stringify(chunk)}`;
+                Input JSON:
+                ${JSON.stringify(indexedChunk)}`;
                 
                 const response = await ai.models.generateContent({
                   model: "gemini-3-flash-preview",
@@ -232,8 +238,12 @@ export default function App() {
                   config: {
                       responseMimeType: "application/json",
                       responseSchema: {
-                          type: Type.ARRAY,
-                          items: { type: Type.STRING }
+                          type: Type.OBJECT,
+                          properties: {
+                              // We can't define dynamic properties easily in schema, so we use simpler object type
+                              // or just rely on JSON mode without strict schema for dynamic keys if needed,
+                              // but Type.OBJECT usually works well for free-form JSON.
+                          }
                       }
                   }
                 });
@@ -244,13 +254,19 @@ export default function App() {
                   return;
                 }
                 
-                const parsed = JSON.parse(jsonStr) as string[];
+                const parsed = JSON.parse(jsonStr) as Record<string, string>;
                 
-                // Fallback for length mismatch
-                while (parsed.length < chunk.length) {
-                    parsed.push(chunk[parsed.length]);
-                }
-                translatedChunks[globalIndex] = parsed;
+                // Reconstruct array ensuring order and existence
+                const resultChunk = chunk.map((originalText, idx) => {
+                    const key = idx.toString();
+                    if (parsed[key] !== undefined) {
+                        return parsed[key];
+                    }
+                    // If key missing, fallback to original
+                    return originalText;
+                });
+
+                translatedChunks[globalIndex] = resultChunk;
 
             } catch (e) {
                 console.error(`Batch translation error (Chunk ${globalIndex+1}):`, e);
