@@ -186,8 +186,8 @@ export default function App() {
   const translateBatch = async (texts: string[], targetLang: string, ai: GoogleGenAI, glossaryJson: string): Promise<string[]> => {
     if (texts.length === 0) return [];
     
-    // Increased chunk size for speed (Gemini Flash has large context)
-    const CHUNK_SIZE = 50; 
+    // Reduced chunk size to prevent alignment errors (Gemini can lose count with too many items)
+    const CHUNK_SIZE = 20; 
     const chunks = [];
     for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
       chunks.push(texts.slice(i, i + CHUNK_SIZE));
@@ -196,7 +196,7 @@ export default function App() {
     const translatedChunks = new Array(chunks.length);
     let completedChunks = 0;
 
-    // Process in parallel batches of 3 to speed up
+    // Process in parallel batches of 3
     const CONCURRENCY = 3;
     
     for (let i = 0; i < chunks.length; i += CONCURRENCY) {
@@ -215,14 +215,15 @@ export default function App() {
 
                 const prompt = `You are a professional translator. Translate the following array of text segments into ${targetLang}.
                 
-                Rules:
+                CRITICAL RULES:
                 1. Return ONLY a JSON array of strings.
-                2. The array MUST have exactly ${chunk.length} items.
-                3. Preserve the original meaning, tone, and formatting (like spaces at start/end).
-                4. If a segment is just a number or symbol, return it as is.
+                2. The output array MUST have EXACTLY ${chunk.length} items. Count them carefully.
+                3. Map each input segment 1-to-1 to an output segment. DO NOT merge or split segments.
+                4. Preserve original formatting (spaces, capitalization, punctuation).
+                5. If a segment is a number, code, or symbol, return it exactly as is.
                 ${glossaryInstruction}
                 
-                Input segments:
+                Input segments (${chunk.length} items):
                 ${JSON.stringify(chunk)}`;
                 
                 const response = await ai.models.generateContent({
