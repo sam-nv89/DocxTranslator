@@ -35,6 +35,27 @@ async function startServer() {
     fs.mkdirSync('uploads');
   }
   
+  // Periodic cleanup of orphaned files (older than 1 hour)
+  setInterval(() => {
+    try {
+      const uploadDir = 'uploads';
+      if (!fs.existsSync(uploadDir)) return;
+      const files = fs.readdirSync(uploadDir);
+      const now = Date.now();
+      files.forEach(file => {
+        if (file === '.gitkeep') return;
+        const filePath = path.join(uploadDir, file);
+        const stats = fs.statSync(filePath);
+        if (now - stats.mtimeMs > 3600000) { // 1 hour
+          fs.unlinkSync(filePath);
+          console.log(`Cleaned up orphaned file: ${file}`);
+        }
+      });
+    } catch (e) {
+      console.error("Cleanup interval error:", e);
+    }
+  }, 3600000);
+
   const upload = multer({ dest: 'uploads/' });
 
   app.use(cors());
@@ -69,10 +90,10 @@ async function startServer() {
 
     const tempPath = path.join('uploads', `${fileId}_original${path.extname(req.file.originalname)}`);
     
-    // Move uploaded file to a stable temp name
-    fs.renameSync(req.file.path, tempPath);
-
     try {
+      // Move uploaded file to a stable temp name
+      fs.renameSync(req.file.path, tempPath);
+
       const segments: string[] = [];
 
       if (fileType === 'docx') {
@@ -161,8 +182,8 @@ async function startServer() {
 
     } catch (error: any) {
       console.error('Extraction error:', error);
-      res.status(500).json({ error: error.message });
       if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      res.status(500).json({ error: error.message });
     }
   });
 
@@ -202,17 +223,49 @@ async function startServer() {
 
             paragraphs.forEach(p => {
               // Layout Logic (KeepNext)
-              const pPr = p.getElementsByTagName('w:pPr')[0];
+              let pPr = p.getElementsByTagName('w:pPr')[0];
+              
+              let isHeading = false;
               if (pPr) {
                   const pStyle = pPr.getElementsByTagName('w:pStyle')[0];
                   if (pStyle) {
                       const val = pStyle.getAttribute('w:val');
-                      if (val && (val.toLowerCase().includes('heading') || val.match(/^[1-9]$/))) { 
-                          let keepNext = pPr.getElementsByTagName('w:keepNext')[0];
-                          if (!keepNext) {
-                              keepNext = doc.createElement('w:keepNext');
-                              pPr.appendChild(keepNext);
-                          }
+                      if (val && (val.toLowerCase().includes('heading') || val.match(/^[1-9]$/) || val.toLowerCase().includes('заголовок'))) { 
+                          isHeading = true;
+                      }
+                  }
+                  const outlineLvl = pPr.getElementsByTagName('w:outlineLvl')[0];
+                  if (outlineLvl) {
+                      isHeading = true;
+                  }
+              }
+
+              if (isHeading) {
+                  if (!pPr) {
+                      pPr = doc.createElement('w:pPr');
+                      p.insertBefore(pPr, p.firstChild);
+                  }
+                  
+                  let keepNext = pPr.getElementsByTagName('w:keepNext')[0];
+                  if (!keepNext) {
+                      keepNext = doc.createElement('w:keepNext');
+                      // OOXML Schema requires w:keepNext to be near the top of w:pPr, right after w:pStyle
+                      const pStyle = pPr.getElementsByTagName('w:pStyle')[0];
+                      if (pStyle && pStyle.nextSibling) {
+                          pPr.insertBefore(keepNext, pStyle.nextSibling);
+                      } else {
+                          pPr.insertBefore(keepNext, pPr.firstChild);
+                      }
+                  }
+                  
+                  let keepLines = pPr.getElementsByTagName('w:keepLines')[0];
+                  if (!keepLines) {
+                      keepLines = doc.createElement('w:keepLines');
+                      // Insert keepLines right after keepNext
+                      if (keepNext && keepNext.nextSibling) {
+                          pPr.insertBefore(keepLines, keepNext.nextSibling);
+                      } else {
+                          pPr.appendChild(keepLines);
                       }
                   }
               }
@@ -362,7 +415,14 @@ async function startServer() {
 
     } catch (error: any) {
       console.error('Compilation error:', error);
-      res.status(500).json({ error: error.message });
+      try {
+        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+      } catch (e) { console.error('Cleanup error during catch:', e); }
+      
+      if (!res.headersSent) {
+        res.status(500).json({ error: error.message });
+      }
     }
   });
 
@@ -374,6 +434,9 @@ async function startServer() {
   // Global Error Handler
   app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
     console.error('Unhandled Server Error:', err);
+    if (res.headersSent) {
+      return next(err);
+    }
     res.status(500).json({ error: err.message || 'Internal Server Error' });
   });
 

@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useRef } from 'react';
-import { Upload, FileText, Check, AlertCircle, Download, Loader2, Zap, Shield, Layers, Globe, Languages } from 'lucide-react';
+import { Upload, FileText, Check, AlertCircle, Download, Loader2, Zap, Globe, Languages, Settings } from 'lucide-react';
 import { GoogleGenAI, Type } from "@google/genai";
 import './types'; // Import global types
 
@@ -35,11 +35,11 @@ const UI_STRINGS = {
     error: "Error",
     targetLang: "Target Language",
     appLang: "Interface Language",
-    features: {
-      structure: { title: "Structure Preservation", desc: "Maintains original layout, tables, and styles perfectly." },
-      secure: { title: "Secure Processing", desc: "Files are processed in memory and deleted immediately." },
-      smart: { title: "Smart Fragmentation", desc: "Intelligently handles run fragmentation for coherent translation." }
-    }
+    settings: "Settings",
+    apiKeyLabel: "API Key",
+    apiKeyPlaceholder: "Paste your API key here...",
+    apiKeyLink: "Get a free key here: ",
+    supportedFormats: "Supported formats: .docx, .xlsx, .odt, .txt, .md"
   },
   ru: {
     title: "DocxTranslator SaaS",
@@ -61,11 +61,11 @@ const UI_STRINGS = {
     error: "Ошибка",
     targetLang: "Язык перевода",
     appLang: "Язык интерфейса",
-    features: {
-      structure: { title: "Сохранение структуры", desc: "Полностью сохраняет оригинальную верстку, таблицы и стили." },
-      secure: { title: "Безопасная обработка", desc: "Файлы обрабатываются в памяти и удаляются сразу после завершения." },
-      smart: { title: "Умная фрагментация", desc: "Интеллектуально обрабатывает фрагментацию текста для связного перевода." }
-    }
+    settings: "Настройки",
+    apiKeyLabel: "API Ключ",
+    apiKeyPlaceholder: "Вставьте ваш ключ здесь...",
+    apiKeyLink: "Получить бесплатный ключ можно здесь: ",
+    supportedFormats: "Поддерживаемые форматы: .docx, .xlsx, .odt, .txt, .md"
   }
 };
 
@@ -81,6 +81,7 @@ export default function App() {
   const [apiKey, setApiKey] = useState(() => {
       return localStorage.getItem('DOCX_TRANSLATOR_API_KEY') || import.meta.env.VITE_GEMINI_API_KEY || '';
   });
+  const [isSettingsOpen, setIsSettingsOpen] = useState(!localStorage.getItem('DOCX_TRANSLATOR_API_KEY') && !import.meta.env.VITE_GEMINI_API_KEY);
   const [isDragging, setIsDragging] = useState(false);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -146,6 +147,17 @@ export default function App() {
     setIsDragging(false);
   };
 
+  const parseJSONResponse = (text: string) => {
+    try {
+        // Remove markdown code blocks if present (e.g., ```json ... ```)
+        const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+        return JSON.parse(cleaned);
+    } catch (e) {
+        console.error("Failed to parse JSON:", text);
+        throw e;
+    }
+  };
+
   const generateGlossaryAndTranslateFilename = async (segments: string[], filename: string, targetLang: string, ai: GoogleGenAI): Promise<{glossary: string, translatedName: string}> => {
       // Take first 20 and last 20 segments to find names (preamble and signatures)
       const sample = [...segments.slice(0, 20), ...segments.slice(-20)];
@@ -172,7 +184,7 @@ export default function App() {
           const jsonStr = response.text;
           if (!jsonStr) return { glossary: "", translatedName: filename };
           
-          const parsed = JSON.parse(jsonStr);
+          const parsed = parseJSONResponse(jsonStr);
           return { 
               glossary: JSON.stringify(parsed.glossary || {}), 
               translatedName: parsed.translatedFilename || filename 
@@ -207,11 +219,13 @@ export default function App() {
     return leading + processed + trailing;
   };
 
+  const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
   const translateBatch = async (texts: string[], targetLang: string, ai: GoogleGenAI, glossaryJson: string): Promise<string[]> => {
     if (texts.length === 0) return [];
     
-    // Reverting to safe, sequential processing with small chunks
-    const CHUNK_SIZE = 10;
+    // Increased chunk size for faster processing, using ID-based alignment for safety
+    const CHUNK_SIZE = 50;
     const chunks = [];
     for (let i = 0; i < texts.length; i += CHUNK_SIZE) {
       chunks.push(texts.slice(i, i + CHUNK_SIZE));
@@ -224,64 +238,99 @@ export default function App() {
         // Update progress
         setProgress(Math.round((i / chunks.length) * 100));
 
-        try {
-            let glossaryInstruction = "";
-            if (glossaryJson && glossaryJson.length > 2) {
-                glossaryInstruction = `
-                IMPORTANT: Use the following glossary for proper names to ensure consistency. 
-                If a name from this list appears, use the provided translation EXACTLY.
-                Glossary: ${glossaryJson}
-                `;
-            }
+        let retries = 0;
+        const MAX_RETRIES = 5; // Increased retries for rate limits
+        let success = false;
 
-            const prompt = `You are a professional translator. Translate the following array of text segments into ${targetLang}.
-            
-            Rules:
-            1. Return ONLY a JSON array of strings.
-            2. The array MUST have exactly ${chunk.length} items.
-            3. Preserve the original meaning, tone, and formatting (like spaces at start/end).
-            4. If a segment is just a number or symbol, return it as is.
-            ${glossaryInstruction}
-            
-            Input segments:
-            ${JSON.stringify(chunk)}`;
-            
-            const response = await ai.models.generateContent({
-              model: "gemini-3-flash-preview",
-              contents: prompt,
-              config: {
-                  responseMimeType: "application/json",
-                  responseSchema: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING }
+        while (!success && retries < MAX_RETRIES) {
+            try {
+                // Add a small delay between requests to be nice to the API
+                if (i > 0 && retries === 0) await delay(500);
+
+                let glossaryInstruction = "";
+                if (glossaryJson && glossaryJson.length > 2) {
+                    glossaryInstruction = `
+                    IMPORTANT: Use the following glossary for proper names to ensure consistency. 
+                    If a name from this list appears, use the provided translation EXACTLY.
+                    Glossary: ${glossaryJson}
+                    `;
+                }
+
+                const chunkArr = chunk.map((text, idx) => ({ id: idx, text }));
+
+                const prompt = `You are a professional translator. Translate the following array of objects into ${targetLang}.
+                
+                Rules:
+                1. Return ONLY a JSON array of objects.
+                2. Each object MUST have an "id" (number) and "text" (string) property.
+                3. The "id" MUST match the input object's "id".
+                4. The "text" MUST be the translation of the input object's "text".
+                5. Preserve the original meaning, tone, and formatting (like spaces at start/end).
+                6. If a segment is just a number or symbol, return it as is.
+                ${glossaryInstruction}
+                
+                Input:
+                ${JSON.stringify(chunkArr)}`;
+                
+                const response = await ai.models.generateContent({
+                  model: "gemini-3-flash-preview",
+                  contents: prompt,
+                  config: {
+                      responseMimeType: "application/json",
+                      responseSchema: {
+                          type: Type.ARRAY,
+                          items: { 
+                              type: Type.OBJECT,
+                              properties: {
+                                  id: { type: Type.INTEGER },
+                                  text: { type: Type.STRING }
+                              },
+                              required: ["id", "text"]
+                          }
+                      }
                   }
-              }
-            });
-            
-            const jsonStr = response.text;
-            if (!jsonStr) {
-              translatedChunks.push(chunk); // Fallback
-              continue;
-            }
-            
-            const parsed = JSON.parse(jsonStr) as string[];
-            
-            // Fallback for length mismatch
-            while (parsed.length < chunk.length) {
-                parsed.push(chunk[parsed.length]);
-            }
-            // If too long, truncate
-            if (parsed.length > chunk.length) {
-                parsed.length = chunk.length;
-            }
-            
-            // Apply text cleaning (remove double spaces, fix punctuation)
-            const cleaned = parsed.map(cleanText);
-            translatedChunks.push(cleaned);
+                });
+                
+                const jsonStr = response.text;
+                if (!jsonStr) {
+                  throw new Error("Empty response from AI");
+                }
+                
+                const parsed = parseJSONResponse(jsonStr) as {id: number, text: string}[];
+                
+                // Reconstruct the array based on IDs to ensure perfect alignment
+                const translatedStrings = new Array(chunk.length);
+                for (let j = 0; j < chunk.length; j++) {
+                    const item = parsed.find(p => p.id === j);
+                    translatedStrings[j] = item ? item.text : chunk[j];
+                }
+                
+                // Apply text cleaning (remove double spaces, fix punctuation)
+                const cleaned = translatedStrings.map(cleanText);
+                translatedChunks.push(cleaned);
+                success = true;
 
-        } catch (e) {
-            console.error(`Batch translation error (Chunk ${i+1}):`, e);
-            translatedChunks.push(chunk); // Fallback
+            } catch (e: any) {
+                console.error(`Batch translation error (Chunk ${i+1}, Attempt ${retries+1}):`, e);
+                
+                // Check for rate limit error (429)
+                const isRateLimit = e.message?.includes('429') || e.status === 429 || JSON.stringify(e).includes('RESOURCE_EXHAUSTED');
+                
+                if (isRateLimit) {
+                    retries++;
+                    const waitTime = Math.pow(2, retries) * 2000; // Exponential backoff: 4s, 8s, 16s...
+                    console.warn(`Rate limit hit. Waiting ${waitTime}ms before retry...`);
+                    await delay(waitTime);
+                } else {
+                    // Non-rate-limit error: break and use fallback
+                    break;
+                }
+            }
+        }
+
+        if (!success) {
+            console.warn(`Failed to translate chunk ${i+1} after retries. Using original text.`);
+            translatedChunks.push(chunk); // Final Fallback
         }
     }
     
@@ -292,7 +341,8 @@ export default function App() {
     if (!file) return;
 
     if (!apiKey) {
-      setErrorMsg(appLang === 'ru' ? 'Пожалуйста, введите API ключ' : 'Please enter an API Key');
+      setIsSettingsOpen(true);
+      setErrorMsg(appLang === 'ru' ? 'Пожалуйста, укажите API ключ в настройках' : 'Please provide an API Key in settings');
       setStatus('error');
       return;
     }
@@ -314,6 +364,12 @@ export default function App() {
       if (!extractContentType || extractContentType.indexOf("application/json") === -1) {
           const text = await extractRes.text();
           console.error("Server returned non-JSON response:", text);
+          if (extractRes.status === 413) {
+              throw new Error(`Файл слишком большой для загрузки (ошибка 413). Пожалуйста, уменьшите размер файла.`);
+          }
+          if (text.includes("<!DOCTYPE html>")) {
+              throw new Error(`Сетевая ошибка: Сервер недоступен или перезагружается. Пожалуйста, подождите пару секунд и попробуйте снова.`);
+          }
           throw new Error(`Server error (${extractRes.status}): Received HTML instead of JSON. Check server logs.`);
       }
 
@@ -351,17 +407,27 @@ export default function App() {
       });
 
       const compileContentType = compileRes.headers.get("content-type");
-      if (!compileContentType || compileContentType.indexOf("application/json") === -1 && compileContentType.indexOf("application/vnd.openxmlformats") === -1 && compileContentType.indexOf("text/plain") === -1 && compileContentType.indexOf("text/markdown") === -1) {
+      
+      // If it's a JSON error response
+      if (compileContentType && compileContentType.includes("application/json")) {
+          const err = await compileRes.json();
+          if (!compileRes.ok) {
+              throw new Error(err.error || 'Compilation failed');
+          }
+      } else if (!compileRes.ok) {
+          // Non-JSON error response (e.g. 502 Bad Gateway HTML)
           const text = await compileRes.text();
-          console.error("Server returned non-JSON response:", text);
+          console.error("Server returned non-JSON error:", text);
+          if (compileRes.status === 413) {
+              throw new Error(`Результат перевода слишком большой (ошибка 413).`);
+          }
+          if (text.includes("<!DOCTYPE html>")) {
+              throw new Error(`Сетевая ошибка: Сервер недоступен или перезагружается. Пожалуйста, попробуйте снова.`);
+          }
           throw new Error(`Server error (${compileRes.status}): Received HTML instead of JSON/File. Check server logs.`);
       }
 
-      if (!compileRes.ok) {
-        const err = await compileRes.json();
-        throw new Error(err.error || 'Compilation failed');
-      }
-
+      // If we got here and it's OK, it's the file download
       const blob = await compileRes.blob();
       const url = window.URL.createObjectURL(blob);
       setDownloadUrl(url);
@@ -399,42 +465,47 @@ export default function App() {
                  <option value="ru">Русский</option>
                </select>
             </div>
+            <button 
+              onClick={() => setIsSettingsOpen(!isSettingsOpen)}
+              className={`p-2 rounded-md transition-colors ${isSettingsOpen ? 'bg-indigo-100 text-indigo-600' : 'text-zinc-500 hover:bg-zinc-100'}`}
+              title={t.settings}
+            >
+              <Settings className="w-5 h-5" />
+            </button>
           </div>
         </div>
       </header>
 
       <main className="max-w-3xl mx-auto px-4 sm:px-6 lg:px-8 py-12">
-        <div className="text-center mb-12">
-          <h2 className="text-3xl font-bold tracking-tight text-zinc-900 mb-4">
+        <div className="text-center mb-10">
+          <h2 className="text-2xl font-bold tracking-tight text-zinc-900 mb-3">
             {t.heroTitle}
           </h2>
-          <p className="text-lg text-zinc-600 max-w-2xl mx-auto">
+          <p className="text-zinc-500 max-w-xl mx-auto">
             {t.heroDesc}
           </p>
         </div>
 
-        {/* API Key Input */}
-        <div className="mb-8 max-w-md mx-auto">
-            <label className="block text-sm font-medium text-zinc-700 mb-2 text-left">
-                AI API Key
-            </label>
-            <div className="relative">
-                <input 
-                    type="password"
-                    value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    placeholder={appLang === 'ru' ? "Вставьте ваш ключ здесь..." : "Paste your API key here..."}
-                    className="w-full pl-4 pr-4 py-2 bg-white border border-zinc-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
-                />
-            </div>
-            <p className="text-xs text-zinc-500 mt-2 text-left">
-                {appLang === 'ru' ? (
-                    <>Получить бесплатный ключ можно здесь: <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-indigo-600 hover:underline">AI Studio</a></>
-                ) : (
-                    <>Get a free key here: <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-indigo-600 hover:underline">AI Studio</a></>
-                )}
-            </p>
-        </div>
+        {/* API Key Input (Collapsible) */}
+        {isSettingsOpen && (
+          <div className="mb-8 max-w-md mx-auto bg-white p-6 rounded-xl border border-zinc-200 shadow-sm animate-in fade-in slide-in-from-top-4">
+              <label className="block text-sm font-medium text-zinc-700 mb-2 text-left">
+                  {t.apiKeyLabel}
+              </label>
+              <div className="relative">
+                  <input 
+                      type="password"
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      placeholder={t.apiKeyPlaceholder}
+                      className="w-full pl-4 pr-4 py-2 bg-zinc-50 border border-zinc-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all"
+                  />
+              </div>
+              <p className="text-xs text-zinc-500 mt-3 text-left">
+                  {t.apiKeyLink} <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer" className="text-indigo-600 hover:underline font-medium">AI Studio</a>
+              </p>
+          </div>
+        )}
 
         {/* Upload Area */}
         <div 
@@ -576,38 +647,7 @@ export default function App() {
             </div>
           )}
         </div>
-
-        {/* Features Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-16">
-          <Feature 
-            icon={<Layers className="w-5 h-5 text-indigo-600" />}
-            title={t.features.structure.title}
-            desc={t.features.structure.desc}
-          />
-          <Feature 
-            icon={<Shield className="w-5 h-5 text-emerald-600" />}
-            title={t.features.secure.title}
-            desc={t.features.secure.desc}
-          />
-          <Feature 
-            icon={<Zap className="w-5 h-5 text-amber-600" />}
-            title={t.features.smart.title}
-            desc={t.features.smart.desc}
-          />
-        </div>
       </main>
-    </div>
-  );
-}
-
-function Feature({ icon, title, desc }: { icon: React.ReactNode, title: string, desc: string }) {
-  return (
-    <div className="p-6 bg-white rounded-xl border border-zinc-200 shadow-sm">
-      <div className="w-10 h-10 bg-zinc-50 rounded-lg flex items-center justify-center mb-4 border border-zinc-100">
-        {icon}
-      </div>
-      <h3 className="font-semibold text-zinc-900 mb-2">{title}</h3>
-      <p className="text-sm text-zinc-600 leading-relaxed">{desc}</p>
     </div>
   );
 }
