@@ -69,6 +69,38 @@ const UI_STRINGS = {
   }
 };
 
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const fetchWithRetry = async (url: string, options: RequestInit, maxRetries = 8): Promise<Response> => {
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            const res = await fetch(url, options);
+            
+            if (res.status === 413) {
+                return res; // Do not retry on Payload Too Large
+            }
+            
+            const contentType = res.headers.get("content-type");
+            
+            if (contentType && contentType.includes("text/html")) {
+                const text = await res.clone().text();
+                const lowerText = text.toLowerCase();
+                if (lowerText.includes("<html") || lowerText.includes("<!doctype html>")) {
+                    console.warn(`[Attempt ${i+1}/${maxRetries}] Received HTML from ${url}. Server might be cold-starting. Retrying in 5s...`);
+                    await delay(5000);
+                    continue;
+                }
+            }
+            return res;
+        } catch (err) {
+            console.warn(`[Attempt ${i+1}/${maxRetries}] Fetch error for ${url}:`, err);
+            if (i === maxRetries - 1) throw err;
+            await delay(5000);
+        }
+    }
+    return fetch(url, options);
+};
+
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState<'idle' | 'uploading' | 'extracting' | 'translating' | 'compiling' | 'completed' | 'error'>('idle');
@@ -96,15 +128,25 @@ export default function App() {
 
   const [translatedFilename, setTranslatedFilename] = useState('');
 
-  // Check server health on mount
+  // Keep server alive during long processes
   React.useEffect(() => {
-    fetch('/api/health')
-      .then(res => {
-        if (!res.ok) console.warn('Server health check failed:', res.status);
-        else console.log('Server health check passed');
-      })
-      .catch(err => console.error('Server health check error:', err));
-  }, []);
+    let intervalId: NodeJS.Timeout;
+    
+    if (status === 'extracting' || status === 'translating' || status === 'compiling') {
+        // Ping every 30 seconds to prevent container from sleeping
+        intervalId = setInterval(() => {
+            fetch('/api/health')
+              .then(res => {
+                if (!res.ok) console.warn('Keep-alive failed:', res.status);
+              })
+              .catch(err => console.warn('Keep-alive error:', err));
+        }, 30000);
+    }
+    
+    return () => {
+        if (intervalId) clearInterval(intervalId);
+    };
+  }, [status]);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -218,8 +260,6 @@ export default function App() {
     
     return leading + processed + trailing;
   };
-
-  const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
   const translateBatch = async (texts: string[], targetLang: string, ai: GoogleGenAI, glossaryJson: string): Promise<string[]> => {
     if (texts.length === 0) return [];
@@ -355,7 +395,7 @@ export default function App() {
 
     try {
       // 1. Extract Text
-      const extractRes = await fetch('/api/extract', {
+      const extractRes = await fetchWithRetry('/api/extract', {
         method: 'POST',
         body: formData,
       });
@@ -367,7 +407,8 @@ export default function App() {
           if (extractRes.status === 413) {
               throw new Error(`Файл слишком большой для загрузки (ошибка 413). Пожалуйста, уменьшите размер файла.`);
           }
-          if (text.includes("<!DOCTYPE html>")) {
+          const lowerText = text.toLowerCase();
+          if (lowerText.includes("<!doctype html>") || lowerText.includes("<html") || lowerText.includes("<body")) {
               throw new Error(`Сетевая ошибка: Сервер недоступен или перезагружается. Пожалуйста, подождите пару секунд и попробуйте снова.`);
           }
           throw new Error(`Server error (${extractRes.status}): Received HTML instead of JSON. Check server logs.`);
@@ -400,7 +441,7 @@ export default function App() {
 
       // 3. Compile Document
       setStatus('compiling');
-      const compileRes = await fetch('/api/compile', {
+      const compileRes = await fetchWithRetry('/api/compile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fileId, translations: translatedSegments, fileType }),
@@ -421,7 +462,8 @@ export default function App() {
           if (compileRes.status === 413) {
               throw new Error(`Результат перевода слишком большой (ошибка 413).`);
           }
-          if (text.includes("<!DOCTYPE html>")) {
+          const lowerText = text.toLowerCase();
+          if (lowerText.includes("<!doctype html>") || lowerText.includes("<html") || lowerText.includes("<body")) {
               throw new Error(`Сетевая ошибка: Сервер недоступен или перезагружается. Пожалуйста, попробуйте снова.`);
           }
           throw new Error(`Server error (${compileRes.status}): Received HTML instead of JSON/File. Check server logs.`);
